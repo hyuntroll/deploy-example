@@ -1,0 +1,85 @@
+name: Infra CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Infra configuration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Compose configuration
+        run: ./scripts/validate.sh
+
+  deploy:
+    name: Deploy production release
+    if: vars.DEPLOY_ENABLED == 'true'
+    needs:
+      - validate
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          test -n "${DEPLOY_HOST}"
+          test -n "${DEPLOY_KNOWN_HOSTS}"
+          test -n "${DEPLOY_SSH_PRIVATE_KEY}"
+
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${DEPLOY_SSH_PRIVATE_KEY}" > "${HOME}/.ssh/id_ed25519"
+          printf '%s\n' "${DEPLOY_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/id_ed25519" "${HOME}/.ssh/known_hosts"
+          ssh-keygen -y -f "${HOME}/.ssh/id_ed25519" >/dev/null
+
+      - name: Transfer release
+        run: |
+          set -Eeuo pipefail
+          DEPLOY_USER="${DEPLOY_USER:-deploy}"
+          DEPLOY_PATH="${DEPLOY_PATH:-/opt/study-modular-sharding}"
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          RELEASE_DIR="${DEPLOY_PATH}/releases/${GITHUB_SHA}"
+
+          ssh -o BatchMode=yes "${REMOTE}" \
+            "mkdir -p '${RELEASE_DIR}' '${DEPLOY_PATH}/shared/runtime'"
+
+          tar \
+            --exclude='./.git' \
+            --exclude='./.runtime' \
+            --exclude='./env/prod.secrets' \
+            --exclude='./env/prod.secrets.example' \
+            -czf - . |
+            ssh -o BatchMode=yes "${REMOTE}" "tar -xzf - -C '${RELEASE_DIR}'"
+
+          ssh -o BatchMode=yes "${REMOTE}" \
+            "test -s '${DEPLOY_PATH}/shared/prod.secrets' && \
+             ln -sfn '${RELEASE_DIR}' '${DEPLOY_PATH}/current' && \
+             SECRETS_FILE='${DEPLOY_PATH}/shared/prod.secrets' \
+             RUNTIME_DIR='${DEPLOY_PATH}/shared/runtime' \
+             '${RELEASE_DIR}/scripts/deploy.sh'"
